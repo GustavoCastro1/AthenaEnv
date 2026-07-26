@@ -29,6 +29,10 @@ static SoundStream * volatile cur_snd = NULL;
  */
 static int stream_thread_id = -1;
 static int stream_sema_id = -1;
+/* Held (count 0) while the thread is inside its read/play loop. Callers wait on
+   it before freeing or seeking a stream, to avoid a use-after-free race with an
+   in-progress fread/ov_read that audsrv_stop_audio() does not interrupt. */
+static int stream_idle_sema = -1;
 
 /* Read the next PCM chunk from a WAV file. Returns bytes written to buffer. */
 static int fill_wav(SoundStream *snd) {
@@ -82,6 +86,7 @@ static void stream_rewind(SoundStream *snd) {
 static int stream_thread(void *arg) {
     while (true) {
         WaitSema(stream_sema_id);
+        WaitSema(stream_idle_sema);
 
         while (stream_playing && cur_snd != NULL) {
             SoundStream *snd = cur_snd;
@@ -99,6 +104,8 @@ static int stream_thread(void *arg) {
                     stream_playing = false;
             }
         }
+
+        SignalSema(stream_idle_sema);
     }
 
     return 0;
@@ -113,6 +120,12 @@ static void ensure_stream_thread(void) {
     sema.max_count = 1;
     sema.option = 0;
     stream_sema_id = CreateSema(&sema);
+
+    ee_sema_t idle_sema;
+    idle_sema.init_count = 1;
+    idle_sema.max_count = 1;
+    idle_sema.option = 0;
+    stream_idle_sema = CreateSema(&idle_sema);
 
     stream_thread_id = create_task("Sound: Streaming Thread", (void*)stream_thread, 16384, 40);
     init_task(stream_thread_id, NULL);
@@ -283,7 +296,6 @@ void sound_play(SoundStream * snd) {
     cur_snd = snd;
 
     audsrv_set_format(&(cur_snd->fmt));
-    audsrv_set_volume(master_volume);
 
     stream_playing = true;
     SignalSema(stream_sema_id);
@@ -298,6 +310,10 @@ void sound_pause() {
 		stream_playing = false;
         /* Unblock the streaming thread if it is inside audsrv_play_audio(). */
         audsrv_stop_audio();
+        /* Wait until the streaming thread has finished its current read/play
+           iteration, so the caller can safely free or seek the stream. */
+        WaitSema(stream_idle_sema);
+        SignalSema(stream_idle_sema);
 	}
 }
 
