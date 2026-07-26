@@ -5,108 +5,255 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include <errno.h>
+#include <math.h>
 
 #include <sound.h>
+#include <taskman.h>
 #include <dbgprintf.h>
 
 static int master_volume = 0;
 
-static bool stream_playing = false;
+static volatile bool stream_playing = false;
 
-static char soundBuffer[AUDIO_STREAM_BUFFER_SIZE];
+static char soundBuffer[AUDIO_STREAM_BUFFER_SIZE] __attribute__((aligned(64)));
 
-static SoundStream *cur_snd = NULL;
+static SoundStream * volatile cur_snd = NULL;
 
-static void sound_wav_fillbuf_handler(void *arg) {
-    int ret = -1;
+/*
+ * Streaming is handled by a dedicated EE thread instead of the audsrv
+ * fill-buffer callback. The fill-buffer callback runs in interrupt context,
+ * where blocking file I/O (fread) and heavy Vorbis decoding (ov_read, which
+ * allocates memory and is not reentrant) are illegal: this crashed PCSX2 for
+ * OGG files and produced unstable playback for WAV files. audsrv_play_audio()
+ * blocks until the ring buffer has room, so a normal thread paces itself.
+ */
+static int stream_thread_id = -1;
+static int stream_sema_id = -1;
+/* Held (count 0) while the thread is inside its read/play loop. Callers wait on
+   it before freeing or seeking a stream, to avoid a use-after-free race with an
+   in-progress fread/ov_read that audsrv_stop_audio() does not interrupt. */
+static int stream_idle_sema = -1;
 
-    ret = fread(soundBuffer, 1, sizeof(soundBuffer), cur_snd->fp);
+/* Read the next PCM chunk from a WAV file. Returns bytes written to buffer. */
+static int fill_wav(SoundStream *snd) {
+    uint32_t remaining = snd->data_size - snd->data_read;
+    uint32_t want = sizeof(soundBuffer);
 
-    if (ret > 0) {
-        audsrv_play_audio(soundBuffer, ret);
-    }
+    if (remaining == 0)
+        return 0;
 
-    if (ret < sizeof(soundBuffer))
-	{
-        fseek(cur_snd->fp, 0x30, SEEK_SET);
+    if (want > remaining)
+        want = remaining;
 
-        if (!cur_snd->loop) {
-            sound_pause();
-		}
-	}
+    int ret = fread(soundBuffer, 1, want, snd->fp);
+    if (ret > 0)
+        snd->data_read += ret;
+
+    return ret;
 }
 
-static void sound_ogg_fillbuf_handler(void *arg) {
-    int ret = -1;
+/* Decode the next PCM chunk from an OGG file. Returns bytes written to buffer. */
+static int fill_ogg(SoundStream *snd) {
     int bitStream = 0;
-    int decodeTotal = AUDIO_STREAM_BUFFER_SIZE;
     int bufferPtr = 0;
+    int holes = 0;
 
-    do {
-        ret = ov_read(cur_snd->fp, soundBuffer + bufferPtr, decodeTotal, 0, 2, 1, &bitStream);
-        
+    while (bufferPtr < AUDIO_STREAM_BUFFER_SIZE) {
+        int ret = ov_read(snd->fp, soundBuffer + bufferPtr,
+                          AUDIO_STREAM_BUFFER_SIZE - bufferPtr, 0, 2, 1, &bitStream);
+
         if (ret > 0) {
             bufferPtr += ret;
-            decodeTotal -= ret;
-        } else if (ret < 0) {
-            dbgprintf("ogg: I/O error while reading.\n");
-            return;
         } else if (ret == 0) {
-            ov_pcm_seek(cur_snd->fp, 0);
-            
-            if (!cur_snd->loop) {
-                sound_pause();
-                return;
+            break; /* genuine end of stream */
+        } else if (ret == OV_HOLE) {
+            /* Recoverable discontinuity: skip it and keep decoding, but bail
+               out if the stream keeps returning holes to avoid spinning. */
+            if (++holes > 8)
+                break;
+        } else {
+            dbgprintf("ogg: decode error %d.\n", ret);
+            break; /* fatal error */
+        }
+    }
+
+    return bufferPtr;
+}
+
+static void stream_rewind(SoundStream *snd) {
+    if (snd->type == OGG_AUDIO) {
+        ov_pcm_seek(snd->fp, 0);
+    } else if (snd->type == WAV_AUDIO) {
+        fseek(snd->fp, snd->data_start, SEEK_SET);
+        snd->data_read = 0;
+    }
+}
+
+static int stream_thread(void *arg) {
+    while (true) {
+        WaitSema(stream_sema_id);
+        WaitSema(stream_idle_sema);
+
+        while (stream_playing && cur_snd != NULL) {
+            SoundStream *snd = cur_snd;
+
+            int bytes = (snd->type == OGG_AUDIO) ? fill_ogg(snd) : fill_wav(snd);
+
+            if (bytes > 0)
+                audsrv_play_audio(soundBuffer, bytes);
+
+            if (bytes < AUDIO_STREAM_BUFFER_SIZE) {
+                /* Reached end of stream. */
+                stream_rewind(snd);
+
+                if (!snd->loop)
+                    stream_playing = false;
             }
         }
-    } while (decodeTotal > 0);
 
-    audsrv_play_audio(soundBuffer, AUDIO_STREAM_BUFFER_SIZE);
+        SignalSema(stream_idle_sema);
+    }
+
+    return 0;
+}
+
+static void ensure_stream_thread(void) {
+    if (stream_thread_id >= 0)
+        return;
+
+    ee_sema_t sema;
+    sema.init_count = 0;
+    sema.max_count = 1;
+    sema.option = 0;
+    stream_sema_id = CreateSema(&sema);
+
+    ee_sema_t idle_sema;
+    idle_sema.init_count = 1;
+    idle_sema.max_count = 1;
+    idle_sema.option = 0;
+    stream_idle_sema = CreateSema(&idle_sema);
+
+    stream_thread_id = create_task("Sound: Streaming Thread", (void*)stream_thread, 16384, 40);
+    init_task(stream_thread_id, NULL);
+}
+
+/*
+ * Parse the RIFF/WAVE structure, locating the "fmt " and "data" chunks
+ * instead of assuming a fixed 44/48-byte header. This fixes unstable playback
+ * for files carrying extra chunks (LIST, fact, JUNK, ...) or a non-canonical
+ * fmt chunk, which previously made AthenaEnv read the wrong format and play
+ * audio data from the wrong offset.
+ */
+static bool parse_wav(SoundStream *wav) {
+    FILE *fp = wav->fp;
+    char id[4];
+    uint32_t size;
+
+    fseek(fp, 0, SEEK_SET);
+
+    if (fread(id, 1, 4, fp) != 4 || memcmp(id, "RIFF", 4) != 0)
+        return false;
+
+    fseek(fp, 4, SEEK_CUR); /* skip RIFF chunk size */
+
+    if (fread(id, 1, 4, fp) != 4 || memcmp(id, "WAVE", 4) != 0)
+        return false;
+
+    bool have_fmt = false;
+    bool have_data = false;
+
+    while (fread(id, 1, 4, fp) == 4 && fread(&size, 1, 4, fp) == 4) {
+        long chunk_start = ftell(fp);
+
+        if (memcmp(id, "fmt ", 4) == 0) {
+            uint16_t fmttag, channels, blockalign, bits;
+            uint32_t samplerate, byterate;
+
+            fread(&fmttag, 1, 2, fp);
+            fread(&channels, 1, 2, fp);
+            fread(&samplerate, 1, 4, fp);
+            fread(&byterate, 1, 4, fp);
+            fread(&blockalign, 1, 2, fp);
+            fread(&bits, 1, 2, fp);
+
+            wav->fmt.channels = channels;
+            wav->fmt.freq = samplerate;
+            wav->fmt.bits = bits;
+            wav->byte_rate = byterate ? byterate : (samplerate * channels * (bits / 8));
+            have_fmt = true;
+        } else if (memcmp(id, "data", 4) == 0) {
+            wav->data_start = (uint32_t)chunk_start;
+            wav->data_size = size;
+            have_data = true;
+            break;
+        }
+
+        /* chunks are word-aligned */
+        fseek(fp, chunk_start + size + (size & 1), SEEK_SET);
+    }
+
+    if (!have_fmt || !have_data)
+        return false;
+
+    fseek(fp, wav->data_start, SEEK_SET);
+    wav->data_read = 0;
+    return true;
 }
 
 SoundStream * load_wav(const char* path) {
-    SoundStream *wav = malloc(sizeof(SoundStream));
-    t_wave header;
+    FILE *fp = fopen(path, "rb");
+    if (fp == NULL) {
+        dbgprintf("wav: Failed to open file %s\n", path);
+        return NULL;
+    }
 
-    int ret;
-	int err;
-	int bytes;
+    SoundStream *wav = calloc(1, sizeof(SoundStream));
+    if (wav == NULL) {
+        fclose(fp);
+        return NULL;
+    }
 
-    wav->fp = fopen(path, "rb");
-    fread(&header, 1, sizeof(t_wave), wav->fp);
-    fseek(wav->fp, 0x30, SEEK_SET);
-
-    wav->fmt.bits = header.w_nbitspersample;
-	wav->fmt.freq = header.w_samplespersec;
-	wav->fmt.channels = header.w_nchannels;
+    wav->fp = fp;
     wav->type = WAV_AUDIO;
     wav->loop = false;
+
+    if (!parse_wav(wav)) {
+        dbgprintf("wav: Invalid or unsupported WAV file %s\n", path);
+        fclose(fp);
+        free(wav);
+        return NULL;
+    }
 
     return wav;
 }
 
-void play_wav(SoundStream * wav) {
-    audsrv_on_fillbuf(AUDIO_STREAM_BUFFER_SIZE, sound_wav_fillbuf_handler, NULL);
-    sound_wav_fillbuf_handler(NULL); // Kick the first chunk
-}
-
 // OGG Support
 SoundStream* load_ogg(const char* path) {
-    FILE *oggFile;
-    SoundStream* ogg;
-
-    ogg = malloc(sizeof(SoundStream));
-    ogg->fp = calloc(1, sizeof(OggVorbis_File));
-
-    oggFile = fopen(path, "rb");
+    FILE *oggFile = fopen(path, "rb");
     if (oggFile == NULL) {
         dbgprintf("ogg: Failed to open Ogg file %s\n", path);
-        return -ENOENT;
+        return NULL;
+    }
+
+    SoundStream* ogg = calloc(1, sizeof(SoundStream));
+    if (ogg == NULL) {
+        fclose(oggFile);
+        return NULL;
+    }
+
+    ogg->fp = calloc(1, sizeof(OggVorbis_File));
+    if (ogg->fp == NULL) {
+        fclose(oggFile);
+        free(ogg);
+        return NULL;
     }
 
     if (ov_open_callbacks(oggFile, ogg->fp, NULL, 0, OV_CALLBACKS_DEFAULT) < 0) {
         dbgprintf("ogg: Input does not appear to be an Ogg bitstream.\n");
-        return -ENOENT;
+        fclose(oggFile);
+        free(ogg->fp);
+        free(ogg);
+        return NULL;
     }
 
 	vorbis_info *vi = ov_info(ogg->fp, -1);
@@ -121,16 +268,15 @@ SoundStream* load_ogg(const char* path) {
     return ogg;
 }
 
-void play_ogg(SoundStream* ogg) {
-    audsrv_on_fillbuf(AUDIO_STREAM_BUFFER_SIZE, sound_ogg_fillbuf_handler, NULL);
-    sound_ogg_fillbuf_handler(NULL); // Kick the first chunk
-}
-
-
 SoundStream *sound_load(const char* path) {
     FILE* f = fopen(path, "rb");
-	uint32_t magic;
-	fread(&magic, 1, 4, f);	
+    if (f == NULL) {
+        dbgprintf("sound: Failed to open file %s\n", path);
+        return NULL;
+    }
+
+	uint32_t magic = 0;
+	fread(&magic, 1, 4, f);
 	fclose(f);
 
 	switch (magic) {
@@ -139,25 +285,26 @@ SoundStream *sound_load(const char* path) {
 		case 0x46464952: /* WAV */
 			return load_wav(path);
 	}
+
+    dbgprintf("sound: Unsupported file format (magic 0x%08X)\n", magic);
+    return NULL;
 }
 
 void sound_play(SoundStream * snd) {
-    if(!stream_playing) {
+    if (snd == NULL)
+        return;
 
-        stream_playing = true;
-        cur_snd = snd;
+    if (stream_playing)
+        return;
 
-        audsrv_set_format(&(cur_snd->fmt));
+    ensure_stream_thread();
 
-        switch (snd->type) {
-            case WAV_AUDIO:
-                play_wav(snd);
-                break;
-            case OGG_AUDIO:
-                play_ogg(snd);
-                break;
-        }
-    } 
+    cur_snd = snd;
+
+    audsrv_set_format(&(cur_snd->fmt));
+
+    stream_playing = true;
+    SignalSema(stream_sema_id);
 }
 
 int is_sound_playing(SoundStream* snd) {
@@ -165,17 +312,24 @@ int is_sound_playing(SoundStream* snd) {
 }
 
 void sound_pause() {
-	if(stream_playing) {
+	if (stream_playing) {
 		stream_playing = false;
-
-        audsrv_wait_audio(AUDIO_STREAM_BUFFER_SIZE);
+        /* Unblock the streaming thread if it is inside audsrv_play_audio(). */
         audsrv_stop_audio();
+        /* Wait until the streaming thread has finished its current read/play
+           iteration, so the caller can safely free or seek the stream. */
+        WaitSema(stream_idle_sema);
+        SignalSema(stream_idle_sema);
 	}
 }
 
 void sound_free(SoundStream* snd) {
+    if (snd == NULL)
+        return;
+
     if (snd == cur_snd) {
         sound_pause();
+        cur_snd = NULL;
     }
 
     if (snd->type == OGG_AUDIO) {
@@ -183,11 +337,10 @@ void sound_free(SoundStream* snd) {
         free(snd->fp);
     } else if (snd->type == WAV_AUDIO) {
         fclose(snd->fp);
-    } 
-    
+    }
+
     snd->fp = NULL;
     free(snd);
-    snd = NULL;
 }
 
 void sound_setvolume(int volume) {
@@ -196,95 +349,78 @@ void sound_setvolume(int volume) {
 }
 
 void sound_rewind(SoundStream* snd) {
-    switch (snd->type) {
-        case OGG_AUDIO:
-            ov_pcm_seek(cur_snd->fp, 0);
-            return;
-        case WAV_AUDIO:
-            fseek(cur_snd->fp, 0x30, SEEK_SET);
-            return;
-    }
+    if (snd == NULL)
+        return;
+
+    bool resume = is_sound_playing(snd);
+
+    if (snd == cur_snd)
+        sound_pause();
+
+    stream_rewind(snd);
+
+    if (resume)
+        sound_play(snd);
 }
 
 int sound_get_duration(SoundStream* snd) {
-    uint32_t f_pos, f_sz;
+    if (snd == NULL)
+        return -1;
 
     if (snd->type == OGG_AUDIO) {
-        return (int)(ov_time_total(snd->fp, -1)*1000);
+        return (int)(ov_time_total(snd->fp, -1) * 1000);
     } else if (snd->type == WAV_AUDIO) {
-        t_wave tmp_header;
-        if (snd == cur_snd)
-            sound_pause();
-        f_pos = ftell(snd->fp);
+        if (snd->byte_rate == 0)
+            return -1;
 
-        fseek(snd->fp, 0, SEEK_SET);
-        fread(&tmp_header, 1, sizeof(t_wave), snd->fp);
-
-        fseek(snd->fp, 0, SEEK_END);
-        f_sz = ftell(snd->fp);
-
-        fseek(snd->fp, f_pos, SEEK_SET);
-        if (snd == cur_snd)
-            sound_play(snd);
-
-        return (f_sz/tmp_header.w_navgbytespersec)*1000;
-    } 
+        return (int)(((uint64_t)snd->data_size * 1000) / snd->byte_rate);
+    }
 
     return -1;
 }
 
 void sound_set_position(SoundStream* snd, int ms) {
-    uint32_t f_pos, n_samples;
+    if (snd == NULL || ms < 0 || ms >= sound_get_duration(snd))
+        return;
+
+    bool was_current = (snd == cur_snd);
+    if (was_current)
+        sound_pause();
 
     if (snd->type == OGG_AUDIO) {
-        if (ms < sound_get_duration(snd)) {
-            if (snd == cur_snd)
-                sound_pause();
-
-            n_samples = ms / 1000 * snd->fmt.freq;
-
-            f_pos = (ms / 1000 * snd->fmt.freq) * (snd->fmt.bits / 16);
-
-            ov_pcm_seek(cur_snd->fp, round(f_pos / AUDIO_STREAM_BUFFER_SIZE) * AUDIO_STREAM_BUFFER_SIZE);
-
-            if (snd == cur_snd)
-                sound_play(snd);
-        }
-
+        ov_time_seek(snd->fp, ms / 1000.0);
     } else if (snd->type == WAV_AUDIO) {
-        if (ms < sound_get_duration(snd)) {
-            if (snd == cur_snd)
-                sound_pause();
+        uint32_t offset = (uint32_t)(((uint64_t)ms * snd->byte_rate) / 1000);
 
-            n_samples = ms / 1000 * snd->fmt.freq;
-
-            f_pos = (ms / 1000 * snd->fmt.freq) * (snd->fmt.bits / 4);
-
-            fseek(snd->fp, f_pos, SEEK_SET);
-
-            if (snd == cur_snd)
-                sound_play(snd);
+        if (snd->fmt.channels && snd->fmt.bits) {
+            uint32_t align = snd->fmt.channels * (snd->fmt.bits / 8);
+            if (align)
+                offset -= (offset % align);
         }
 
-    } 
+        if (offset > snd->data_size)
+            offset = snd->data_size;
+
+        fseek(snd->fp, snd->data_start + offset, SEEK_SET);
+        snd->data_read = offset;
+    }
+
+    if (was_current)
+        sound_play(snd);
 }
 
 int sound_get_position(SoundStream* snd) {
-    uint32_t f_pos, ms;
+    if (snd == NULL)
+        return -1;
 
     if (snd->type == OGG_AUDIO) {
-        f_pos = ov_pcm_tell(snd->fp);
-	    
-        ms = round(f_pos / (snd->fmt.freq / 1000 * (snd->fmt.bits / 16)));
-
-        return ms;
+        return (int)(ov_time_tell(snd->fp) * 1000);
     } else if (snd->type == WAV_AUDIO) {
-        f_pos = ftell(snd->fp);
+        if (snd->byte_rate == 0)
+            return -1;
 
-        ms = round(f_pos / (snd->fmt.freq / 1000 * (snd->fmt.bits / 4)));
-
-        return ms;
-    } 
+        return (int)(((uint64_t)snd->data_read * 1000) / snd->byte_rate);
+    }
 
     return -1;
 }

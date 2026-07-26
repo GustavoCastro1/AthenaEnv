@@ -30,6 +30,12 @@ typedef struct {
     struct audsrv_fmt_t fmt;
     int type;
     bool loop;
+
+    /* WAV only: located data chunk and playback cursor (in bytes). */
+    uint32_t data_start;
+    uint32_t data_size;
+    uint32_t data_read;
+    uint32_t byte_rate;
 } SoundStream;
 
 SoundStream *sound_load(const char* path);
