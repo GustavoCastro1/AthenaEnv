@@ -56,6 +56,7 @@ static int fill_wav(SoundStream *snd) {
 static int fill_ogg(SoundStream *snd) {
     int bitStream = 0;
     int bufferPtr = 0;
+    int holes = 0;
 
     while (bufferPtr < AUDIO_STREAM_BUFFER_SIZE) {
         int ret = ov_read(snd->fp, soundBuffer + bufferPtr,
@@ -64,10 +65,15 @@ static int fill_ogg(SoundStream *snd) {
         if (ret > 0) {
             bufferPtr += ret;
         } else if (ret == 0) {
-            break; /* end of stream */
+            break; /* genuine end of stream */
+        } else if (ret == OV_HOLE) {
+            /* Recoverable discontinuity: skip it and keep decoding, but bail
+               out if the stream keeps returning holes to avoid spinning. */
+            if (++holes > 8)
+                break;
         } else {
             dbgprintf("ogg: decode error %d.\n", ret);
-            break;
+            break; /* fatal error */
         }
     }
 
@@ -346,7 +352,15 @@ void sound_rewind(SoundStream* snd) {
     if (snd == NULL)
         return;
 
+    bool resume = is_sound_playing(snd);
+
+    if (snd == cur_snd)
+        sound_pause();
+
     stream_rewind(snd);
+
+    if (resume)
+        sound_play(snd);
 }
 
 int sound_get_duration(SoundStream* snd) {
